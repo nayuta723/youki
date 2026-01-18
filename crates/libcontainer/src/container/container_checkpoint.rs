@@ -24,6 +24,13 @@ impl Container {
     pub fn checkpoint(&mut self, opts: &CheckpointOptions) -> Result<(), LibcontainerError> {
         self.refresh_status()?;
 
+        if !opts.image_path.is_dir() {
+            fs::create_dir_all(&opts.image_path).map_err(|err| {
+                tracing::error!(path = ?opts.image_path, ?err, "failed to create checkpoint image directory");
+                LibcontainerError::OtherIO(err)
+            })?;
+        }
+
         // can_pause() checks if the container is running. That also works for
         // checkpoitning. is_running() would make more sense here, but let's
         // just reuse existing functions.
