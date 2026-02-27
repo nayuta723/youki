@@ -1,4 +1,4 @@
-use std::fs::{DirBuilder, File, read_link};
+use std::fs::{DirBuilder, File, read_link, create_dir_all};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::AsRawFd;
@@ -6,8 +6,9 @@ use std::os::unix::io::AsRawFd;
 use libcgroups::common::CgroupSetup::{Hybrid, Legacy};
 #[cfg(feature = "v1")]
 use libcgroups::common::DEFAULT_CGROUP_ROOT;
-use oci_spec::runtime::Spec;
+use oci_spec::runtime::{Spec, LinuxNamespaceType};
 
+use super::container_criu::{handle_checkpointing_external_namespaces, CRIU_VERSION_MINIMUM};
 use super::{Container, ContainerStatus};
 use crate::container::container::CheckpointOptions;
 use crate::error::LibcontainerError;
@@ -25,6 +26,13 @@ impl Container {
     pub fn checkpoint(&mut self, opts: &CheckpointOptions) -> Result<(), LibcontainerError> {
         self.refresh_status()?;
 
+        if !opts.image_path.is_dir() {
+            create_dir_all(&opts.image_path).map_err(|err| {
+                tracing::error!(path = ?opts.image_path, ?err, "failed to create checkpoint image directory");
+                LibcontainerError::OtherIO(err)
+            })?;
+        }
+
         // can_pause() checks if the container is running. That also works for
         // checkpointing. is_running() would make more sense here, but let's
         // just reuse existing functions.
@@ -41,12 +49,16 @@ impl Container {
             }
         }
 
+        // We are relying on the CRIU version RPC which was introduced with CRIU 3.0.0
+        self.check_criu_version(CRIU_VERSION_MINIMUM)?;
+
         let mut criu = rust_criu::Criu::new().map_err(|e| {
             LibcontainerError::Checkpoint(CheckpointError::CriuError(format!(
                 "error in creating criu struct: {}",
                 e
             )))
         })?;
+
         // We need to tell CRIU that all bind mounts are external. CRIU will fail checkpointing
         // if it does not know that these bind mounts are coming from the outside of the container.
         // This information is needed during restore again. The external location of the bind
@@ -164,6 +176,45 @@ impl Container {
                 .into_string()
                 .unwrap(),
         );
+
+        // Handle external namespaces (network and PID)
+        // This follows runc's handleCheckpointingExternalNamespaces
+        handle_checkpointing_external_namespaces(&mut criu, &spec, LinuxNamespaceType::Network)?;
+        handle_checkpointing_external_namespaces(&mut criu, &spec, LinuxNamespaceType::Pid)?;
+
+        // TODO: The following features from runc are not yet implemented:
+        //
+        // 1. ManageCgroupsMode - Set cgroups mode from opts (IGNORE, CG_NONE, PROPS, SOFT, FULL, STRICT, DEFAULT)
+        //    runc: cgMode, err := criuCgMode(criuOpts.ManageCgroupsMode)
+        //
+        // 2. CRIU Configuration File - Handle criu configuration file (criu 3.11+)
+        //    runc: c.handleCriuConfigurationFile(&rpcOpts)
+        //
+        // 3. Cgroup Freezer - Use cgroup freezer instead of ptrace (criu 3.14+ for v2)
+        //    runc: rpcOpts.FreezeCgroup = proto.String(fcg)
+        //
+        // 5. Page Server - Support for remote page server
+        //    runc: rpcOpts.Ps = &criurpc.CriuPageServerInfo{Address, Port}
+        //
+        // 6. Pre-dump / Iterative Migration - Support for incremental checkpoints
+        //    runc: CriuReqType_PRE_DUMP, ParentImg, TrackMem
+        //
+        // 7. Lazy Pages - Support for lazy migration
+        //    runc: rpcOpts.LazyPages, checkCriuFeatures
+        //
+        // 8. Additional Options - TcpSkipInFlight, LinkRemap, EmptyNs, AutoDedup
+        //
+        // 9. Mask Paths - Add masked paths to CRIU dump
+        //    runc: c.addMaskPaths(req)
+        //
+        // 10. Device Mounts - Add device mounts to CRIU dump
+        //     runc: c.addCriuDumpMount(req, m) for devices
+        //
+        // 11. CRIU Feature Check - Check if CRIU supports required features
+        //     runc: c.checkCriuFeatures(criuOpts, &feat)
+        //
+        // 12. Error Logging - Log CRIU errors on failure
+        //     runc: logCriuErrors(logDir, logFile)
 
         criu.dump().map_err(|err| {
             tracing::error!(?err, id = ?self.id(), logfile = ?opts.image_path.join(CRIU_CHECKPOINT_LOG_FILE), "checkpointing container failed");
